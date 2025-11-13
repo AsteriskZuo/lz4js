@@ -31,6 +31,11 @@ var runMask = (1 << runBits) - 1;
 var blockBuf = makeBuffer(5 << 20);
 var hashTable = makeHashTable();
 
+// Streaming constants
+var streamRingBufferSize = (128 + 64) * 1024; // 192KB
+var streamMaxBlockSize = 64 * 1024;           // 64KB
+var streamDictSize = 64 * 1024;               // 64KB max dictionary
+
 // Frame constants.
 var magicNum = 0x184D2204;
 
@@ -569,4 +574,384 @@ exports.compress = function compress (src, maxSize) {
   }
 
   return dst;
+};
+
+// Streaming Compression/Decompression
+// --
+
+// Create a streaming encoder state
+exports.createStreamEncoder = function createStreamEncoder () {
+  return {
+    // Ring buffer for maintaining history
+    ringBuffer: makeBuffer(streamRingBufferSize),
+    
+    // Hash table for this stream
+    hashTable: makeHashTable(),
+    
+    // Current offset in ring buffer
+    offset: 0,
+    
+    // Size of valid dictionary data
+    dictSize: 0,
+    
+    // Current offset value (for hash table indexing)
+    currentOffset: 0,
+    
+    // Configuration
+    maxBlockSize: streamMaxBlockSize,
+    ringBufferSize: streamRingBufferSize
+  };
+};
+
+// Create a streaming decoder state
+exports.createStreamDecoder = function createStreamDecoder () {
+  return {
+    // Ring buffer for maintaining history
+    ringBuffer: makeBuffer(streamRingBufferSize),
+    
+    // Current offset in ring buffer
+    offset: 0,
+    
+    // Size of valid dictionary data
+    dictSize: 0,
+    
+    // Configuration
+    maxBlockSize: streamMaxBlockSize,
+    ringBufferSize: streamRingBufferSize
+  };
+};
+
+// Reset encoder stream
+exports.resetStreamEncoder = function resetStreamEncoder (stream) {
+  clearHashTable(stream.hashTable);
+  stream.offset = 0;
+  stream.dictSize = 0;
+  stream.currentOffset = 0;
+};
+
+// Reset decoder stream
+exports.resetStreamDecoder = function resetStreamDecoder (stream) {
+  stream.offset = 0;
+  stream.dictSize = 0;
+};
+
+// Compress block with dictionary (continue mode)
+exports.compressBlockContinue = function compressBlockContinue (stream, src, srcIndex, srcLength, dst, dstIndex, maxDstSize) {
+  var mIndex, mAnchor, mLength, mOffset, mStep;
+  var literalCount, dIndex, sEnd, n;
+  var ringPos, dictStart, dictEnd;
+
+  // Validate input
+  if (!stream || !stream.ringBuffer) {
+    throw new Error('Invalid stream');
+  }
+  
+  if (srcLength > stream.maxBlockSize) {
+    throw new Error('Source length exceeds max block size');
+  }
+
+  // Copy source data into ring buffer
+  ringPos = stream.offset;
+  for (var i = 0; i < srcLength; i++) {
+    stream.ringBuffer[ringPos + i] = src[srcIndex + i];
+  }
+
+  // Dictionary is the data before current position (up to 64KB)
+  dictStart = ringPos > streamDictSize ? ringPos - streamDictSize : 0;
+  dictEnd = ringPos;
+  
+  // Now compress from ring buffer
+  var compSrc = stream.ringBuffer;
+  var compSrcStart = ringPos;
+  var compSrcEnd = ringPos + srcLength;
+
+  // Setup initial state
+  dIndex = dstIndex;
+  sEnd = compSrcEnd;
+  mAnchor = compSrcStart;
+  var sIndex = compSrcStart;
+
+  // Adjust hash table for current offset
+  var baseOffset = stream.currentOffset;
+
+  // Process only if block is large enough
+  if (srcLength >= minLength) {
+    var searchMatchCount = (1 << skipTrigger) + 3;
+
+    // Consume until last n literals (Lz4 spec limitation)
+    while (sIndex + minMatch < sEnd - searchLimit) {
+      var seq = util.readU32(compSrc, sIndex);
+      var hash = util.hashU32(seq) >>> 0;
+
+      // Crush hash to 16 bits
+      hash = ((hash >> 16) ^ hash) >>> 0 & 0xffff;
+
+      // Look for a match in the hashtable
+      var tableIndex = stream.hashTable[hash];
+      
+      // Convert to absolute position (tableIndex stores baseOffset + relative position)
+      if (tableIndex > 0) {
+        mIndex = tableIndex - 1;
+      } else {
+        mIndex = -1;
+      }
+
+      // Current absolute position
+      var currentPos = baseOffset + (sIndex - compSrcStart);
+      
+      // Put current position in hash table
+      stream.hashTable[hash] = currentPos + 1;
+
+      // Check if match is valid
+      // - Must be within 64KB distance
+      // - Must be in accessible range (dictionary or current block)
+      var isValidMatch = false;
+      var matchOffset = 0;
+      
+      if (mIndex >= 0) {
+        matchOffset = currentPos - mIndex;
+        
+        // Must be within 64KB and must point to valid data
+        if (matchOffset > 0 && matchOffset <= 0xFFFF) {
+          // Calculate where this match position is in ring buffer
+          var matchRingPos = sIndex - matchOffset;
+          
+          // Check if it's in valid range (dictionary or current block)
+          if (matchRingPos >= dictStart && matchRingPos >= 0) {
+            // Verify the match
+            if (util.readU32(compSrc, matchRingPos) === seq) {
+              isValidMatch = true;
+              mIndex = matchRingPos;
+            }
+          }
+        }
+      }
+
+      if (!isValidMatch) {
+        mStep = searchMatchCount++ >> skipTrigger;
+        sIndex += mStep;
+        continue;
+      }
+
+      searchMatchCount = (1 << skipTrigger) + 3;
+
+      // Calculate literal count and offset
+      literalCount = sIndex - mAnchor;
+      mOffset = sIndex - mIndex;
+
+      // We've already matched one word, so get that out of the way
+      sIndex += minMatch;
+      mIndex += minMatch;
+
+      // Determine match length
+      mLength = sIndex;
+      while (sIndex < sEnd - searchLimit && compSrc[sIndex] === compSrc[mIndex]) {
+        sIndex++;
+        mIndex++;
+      }
+      mLength = sIndex - mLength;
+
+      // Write token + literal count
+      var token = mLength < mlMask ? mLength : mlMask;
+      if (literalCount >= runMask) {
+        dst[dIndex++] = (runMask << mlBits) + token;
+        for (n = literalCount - runMask; n >= 0xff; n -= 0xff) {
+          dst[dIndex++] = 0xff;
+        }
+        dst[dIndex++] = n;
+      } else {
+        dst[dIndex++] = (literalCount << mlBits) + token;
+      }
+
+      // Write literals
+      for (var j = 0; j < literalCount; j++) {
+        dst[dIndex++] = compSrc[mAnchor + j];
+      }
+
+      // Write offset
+      dst[dIndex++] = mOffset;
+      dst[dIndex++] = (mOffset >> 8);
+
+      // Write match length
+      if (mLength >= mlMask) {
+        for (n = mLength - mlMask; n >= 0xff; n -= 0xff) {
+          dst[dIndex++] = 0xff;
+        }
+        dst[dIndex++] = n;
+      }
+
+      // Move the anchor
+      mAnchor = sIndex;
+    }
+  }
+
+  // Write remaining literals
+  literalCount = sEnd - mAnchor;
+  if (literalCount > 0 || mAnchor === compSrcStart) {
+    // Write literal token+count
+    if (literalCount >= runMask) {
+      dst[dIndex++] = (runMask << mlBits);
+      for (n = literalCount - runMask; n >= 0xff; n -= 0xff) {
+        dst[dIndex++] = 0xff;
+      }
+      dst[dIndex++] = n;
+    } else {
+      dst[dIndex++] = (literalCount << mlBits);
+    }
+
+    // Write literals
+    sIndex = mAnchor;
+    while (sIndex < sEnd) {
+      dst[dIndex++] = compSrc[sIndex++];
+    }
+  }
+
+  // Update stream state
+  stream.currentOffset += srcLength;
+  stream.offset += srcLength;
+  
+  // Update dictionary size
+  if (stream.dictSize + srcLength <= streamDictSize) {
+    stream.dictSize += srcLength;
+  } else {
+    stream.dictSize = streamDictSize;
+  }
+  
+  // Handle ring buffer wraparound
+  if (stream.offset >= stream.ringBufferSize - stream.maxBlockSize) {
+    // Move last 64KB to the beginning
+    var dictData = stream.ringBuffer;
+    var srcPos = stream.offset - streamDictSize;
+    for (var k = 0; k < streamDictSize; k++) {
+      stream.ringBuffer[k] = dictData[srcPos + k];
+    }
+    stream.offset = streamDictSize;
+    stream.dictSize = streamDictSize;
+  }
+
+  return dIndex - dstIndex;
+};
+
+// Decompress block with dictionary (continue mode)
+exports.decompressBlockContinue = function decompressBlockContinue (stream, src, sIndex, sLength, maxOutputSize) {
+  var mLength, mOffset, sEnd, n, i;
+  var dIndex, dStart;
+  var hasCopyWithin = stream.ringBuffer.copyWithin !== undefined && stream.ringBuffer.fill !== undefined;
+
+  // Validate input
+  if (!stream || !stream.ringBuffer) {
+    throw new Error('Invalid stream');
+  }
+
+  if (maxOutputSize > stream.maxBlockSize) {
+    throw new Error('Output size exceeds max block size');
+  }
+
+  // Decompress directly into ring buffer
+  var dst = stream.ringBuffer;
+  dStart = stream.offset;
+  dIndex = dStart;
+  
+  // Dictionary is the data before current position
+  var dictStart = dStart > streamDictSize ? dStart - streamDictSize : 0;
+
+  // Setup initial state
+  sEnd = sIndex + sLength;
+
+  // Consume entire input block
+  while (sIndex < sEnd) {
+    var token = src[sIndex++];
+
+    // Copy literals
+    var literalCount = (token >> 4);
+    if (literalCount > 0) {
+      // Parse length
+      if (literalCount === 0xf) {
+        while (true) {
+          literalCount += src[sIndex];
+          if (src[sIndex++] !== 0xff) {
+            break;
+          }
+        }
+      }
+
+      // Copy literals
+      for (n = sIndex + literalCount; sIndex < n;) {
+        dst[dIndex++] = src[sIndex++];
+      }
+    }
+
+    if (sIndex >= sEnd) {
+      break;
+    }
+
+    // Copy match
+    mLength = (token & 0xf);
+
+    // Parse offset
+    mOffset = src[sIndex++] | (src[sIndex++] << 8);
+
+    // Parse length
+    if (mLength === 0xf) {
+      while (true) {
+        mLength += src[sIndex];
+        if (src[sIndex++] !== 0xff) {
+          break;
+        }
+      }
+    }
+
+    mLength += minMatch;
+
+    // Copy match
+    var matchPos = dIndex - mOffset;
+    
+    // Check if match is in valid range
+    if (matchPos < dictStart) {
+      throw new Error('Match offset out of range');
+    }
+
+    // Handle match copy with possible overlap
+    if (hasCopyWithin && mOffset === 1) {
+      dst.fill(dst[dIndex - 1] | 0, dIndex, dIndex + mLength);
+      dIndex += mLength;
+    } else if (hasCopyWithin && mOffset > mLength && mLength > 31) {
+      dst.copyWithin(dIndex, matchPos, matchPos + mLength);
+      dIndex += mLength;
+    } else {
+      for (i = matchPos, n = matchPos + mLength; i < n;) {
+        dst[dIndex++] = dst[i++] | 0;
+      }
+    }
+  }
+
+  var decompressedSize = dIndex - dStart;
+
+  // Update stream state
+  stream.offset += decompressedSize;
+  
+  // Update dictionary size
+  if (stream.dictSize + decompressedSize <= streamDictSize) {
+    stream.dictSize += decompressedSize;
+  } else {
+    stream.dictSize = streamDictSize;
+  }
+  
+  // Handle ring buffer wraparound
+  if (stream.offset >= stream.ringBufferSize - stream.maxBlockSize) {
+    // Move last 64KB to the beginning
+    var dictData = stream.ringBuffer;
+    var srcPos = stream.offset - streamDictSize;
+    for (var k = 0; k < streamDictSize; k++) {
+      stream.ringBuffer[k] = dictData[srcPos + k];
+    }
+    stream.offset = streamDictSize;
+    stream.dictSize = streamDictSize;
+  }
+
+  return {
+    data: stream.ringBuffer,
+    offset: dStart,
+    length: decompressedSize
+  };
 };

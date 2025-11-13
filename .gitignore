@@ -1,1 +1,6 @@
 node_modules
+**/test_c_compat
+**/test_c_to_js.lz4
+**/test_c.lz4
+**/test_js_to_c.lz4
+**/test_js.lz4
